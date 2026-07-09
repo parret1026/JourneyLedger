@@ -387,13 +387,42 @@ let ocrQueue = []; // {fileName, dataUrl, status, text, progress}
 function renderPhotoPane(){
   const pane = document.getElementById('entryPhotoPane');
   pane.innerHTML = `
-    <div class="banner">📷 上傳收據照片後，系統會在瀏覽器內用 OCR（支援日文／繁中／英文）辨識文字，結果會顯示在下方供你確認並填入欄位。<br>
-    ⚠️ 辨識為自動判讀，正確率有限，尤其日文收據版面複雜時，請務必核對日期／金額／品項後再加入清單。首次使用需連網下載辨識語言包（約數MB），之後可離線使用。</div>
+    <div class="banner">📷 離線 OCR 對「日文感熱紙小票」辨識率天生有限（字小、印刷模糊、多語言混合會互相干擾）。已加入影像強化（灰階+對比+放大）與語言選擇來改善，但仍可能出錯，請務必核對後再加入清單。<br>
+    💡 <b>更準的做法</b>：把收據照片直接傳到與 Claude 的對話中，請它讀取並翻譯成繁中，再把整理好的「品項,金額」貼到下方「貼上收據內容快速建立」，一次建立整張收據的多筆項目。</div>
+    <div class="field" style="max-width:280px;">
+      <label>收據語言（選對語言可大幅提升辨識率）</label>
+      <select id="ocrLangSelect">
+        <option value="jpn" selected>日文（日本收據，推薦）</option>
+        <option value="chi_tra">繁體中文</option>
+        <option value="eng">英文</option>
+        <option value="jpn+eng">日文＋英文</option>
+      </select>
+    </div>
     <div class="upload-zone" id="dropZone">
       📤 點選或拖曳收據照片到這裡（可多選批次上傳）<br><span class="muted">支援 JPG / PNG，可直接用手機相機拍照上傳</span>
       <input type="file" id="photoInput" accept="image/*" capture="environment" multiple style="display:none;">
     </div>
     <div id="ocrQueueList" style="margin-top:14px;"></div>
+
+    <div class="card" style="margin-top:16px;padding:14px;background:#faf7fc;border-style:dashed;">
+      <h3 style="margin:0 0 10px;font-size:14px;color:var(--primary-dark);">📋 貼上收據內容快速建立（同一張收據可一次建立多筆品項）</h3>
+      <div class="formgrid">
+        <div class="field"><label>消費日期</label><input type="date" id="bp_date"></div>
+        <div class="field"><label>時間</label><input type="time" id="bp_time"></div>
+        <div class="field"><label>地點</label><input type="text" id="bp_location" placeholder="例：新宿歌舞伎町"></div>
+        <div class="field"><label>類別</label><select id="bp_category">${state.categories.map(c=>`<option>${c}</option>`).join('')}</select></div>
+        <div class="field"><label>付款方式</label><select id="bp_payment">${state.paymentMethods.map(p=>`<option value="${p.id}">${p.name}</option>`).join('')}</select></div>
+        <div class="field"><label>幣別</label><select id="bp_currency">${Object.keys(state.currencies).map(c=>`<option>${c}</option>`).join('')}</select></div>
+      </div>
+      <div class="field">
+        <label>品項與金額（每行一筆，格式：品項,金額）</label>
+        <textarea id="bulkPasteText" rows="5" placeholder="拉麵,1080&#10;伴手禮餅乾,2160&#10;礦泉水,150"></textarea>
+      </div>
+      <div style="text-align:right;">
+        <button class="btn small" onclick="bulkCreateFromPaste()">建立這些項目</button>
+      </div>
+    </div>
+
     <div style="text-align:right;margin-top:8px;">
       <button class="btn outline" onclick="closeEntryModal()">關閉</button>
     </div>
@@ -404,6 +433,38 @@ function renderPhotoPane(){
   input.addEventListener('change', (ev)=>handleFiles(ev.target.files));
   zone.addEventListener('dragover', e=>{e.preventDefault();});
   zone.addEventListener('drop', e=>{ e.preventDefault(); handleFiles(e.dataTransfer.files); });
+}
+
+function bulkCreateFromPaste(){
+  const val = id => document.getElementById(id).value;
+  const date = val('bp_date'), time = val('bp_time'), location = val('bp_location');
+  const category = val('bp_category'), paymentMethod = val('bp_payment'), currency = val('bp_currency');
+  const text = document.getElementById('bulkPasteText').value.trim();
+  if(!text){ alert('請先貼上「品項,金額」內容'); return; }
+  const lines = text.split('\n').map(l=>l.trim()).filter(Boolean);
+  let count = 0;
+  lines.forEach(line=>{
+    let item, amount;
+    const parts = line.split(/[,\t]/).map(s=>s.trim()).filter(Boolean);
+    if(parts.length>=2){
+      amount = parseFloat(parts[parts.length-1].replace(/[^\d.\-]/g,''));
+      item = parts.slice(0,-1).join(' ');
+    } else {
+      const m = line.match(/^(.*?)[\s]+([\d,]+(?:\.\d+)?)\s*$/);
+      if(m){ item = m[1].trim(); amount = parseFloat(m[2].replace(/,/g,'')); }
+    }
+    if(!item || isNaN(amount)) return;
+    state.expenses.push({
+      id: uid(), date, time, location, item, category, paymentMethod, currency,
+      amount, taxRefund: 0, note: '',
+    });
+    count++;
+  });
+  if(count===0){ alert('沒有成功解析任何一行，請確認格式為「品項,金額」，一行一筆'); return; }
+  saveState();
+  document.getElementById('bulkPasteText').value = '';
+  alert(`已新增 ${count} 筆收據項目`);
+  render();
 }
 
 function handleFiles(fileList){
@@ -440,22 +501,62 @@ function updateOcrText(id, val){
   if(item) item.text = val;
 }
 
-async function getWorker(){
-  if(ocrWorker) return ocrWorker;
-  ocrWorker = await Tesseract.createWorker(['jpn','chi_tra','eng']);
+let ocrWorkerLang = null;
+async function getWorker(lang){
+  if(ocrWorker && ocrWorkerLang===lang) return ocrWorker;
+  if(ocrWorker){ try{ await ocrWorker.terminate(); }catch(e){} ocrWorker=null; }
+  ocrWorker = await Tesseract.createWorker(lang.split('+'));
+  ocrWorkerLang = lang;
   return ocrWorker;
+}
+
+// 灰階 + 對比拉伸 + 放大，改善感熱紙小票的辨識率
+function preprocessImage(file){
+  return new Promise((resolve)=>{
+    const img = new Image();
+    img.onload = ()=>{
+      const scale = Math.max(1, Math.min(2.2, 1800/img.width));
+      const w = Math.round(img.width*scale), h = Math.round(img.height*scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      try{
+        const imgData = ctx.getImageData(0,0,w,h);
+        const d = imgData.data;
+        const gray = new Float32Array(w*h);
+        let min=255, max=0;
+        for(let i=0, p=0; i<d.length; i+=4, p++){
+          const g = 0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
+          gray[p]=g; if(g<min)min=g; if(g>max)max=g;
+        }
+        const range = Math.max(1, max-min);
+        for(let i=0, p=0; i<d.length; i+=4, p++){
+          const v = (gray[p]-min)/range*255;
+          d[i]=d[i+1]=d[i+2]=v;
+        }
+        ctx.putImageData(imgData,0,0);
+      }catch(e){ /* 若跨來源限制無法讀取像素，直接用放大後的原圖 */ }
+      canvas.toBlob(blob=> resolve(blob||file), 'image/png');
+    };
+    img.onerror = ()=>resolve(file);
+    img.src = URL.createObjectURL(file);
+  });
 }
 
 async function processOcrItem(item, file){
   try{
+    item.status = '影像強化處理中…'; renderOcrQueue();
+    const lang = document.getElementById('ocrLangSelect')?.value || 'jpn';
+    const processed = await preprocessImage(file);
     item.status = '辨識中…'; renderOcrQueue();
-    const worker = await getWorker();
-    const result = await worker.recognize(file);
+    const worker = await getWorker(lang);
+    const result = await worker.recognize(processed);
     item.text = (result.data.text||'').trim();
     item.status = '完成，請確認內容';
     item.progress = 100;
   }catch(err){
-    item.status = '辨識失敗，請手動輸入（可能需要網路連線下載語言包）';
+    item.status = '辨識失敗，請改用下方「貼上收據內容快速建立」或手動輸入（可能需要網路連線下載語言包）';
     console.error(err);
   }
   renderOcrQueue();
